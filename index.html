@@ -266,26 +266,43 @@
         // --- 本機儲存 (Local Storage) 機制 ---
         const PORTFOLIO_STORAGE_KEY = 'twStockPortfolio';
 
+        // 為了確保資料結構一致，給定一個預設資料
+        const defaultPortfolio = [
+            { id: '2330', name: '台積電', type: 'tech', shares: 1000, avgPrice: 750.00, currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
+            { id: '2317', name: '鴻海', type: 'tech', shares: 2000, avgPrice: 165.00, currentPrice: 158.50, dividend: '年配 (7)' },
+            { id: '2454', name: '聯發科', type: 'tech', shares: 1000, avgPrice: 1000.00, currentPrice: 1120.00, dividend: '半年配 (1,7)' },
+            { id: '2603', name: '長榮', type: 'shipping', shares: 1000, avgPrice: 272.00, currentPrice: 215.00, dividend: '年配 (7)' }
+        ];
+
         function loadPortfolio() {
-            const storedData = localStorage.getItem(PORTFOLIO_STORAGE_KEY);
-            if (storedData) {
-                try {
-                    return JSON.parse(storedData);
-                } catch (e) {
-                    console.error("無法解析儲存的庫存資料", e);
+            try {
+                // 先嘗試測試 localStorage 是否可用
+                const testKey = '__test__';
+                localStorage.setItem(testKey, testKey);
+                localStorage.removeItem(testKey);
+
+                const storedData = localStorage.getItem(PORTFOLIO_STORAGE_KEY);
+                if (storedData) {
+                    const parsedData = JSON.parse(storedData);
+                    // 簡單驗證取出的資料是否為陣列
+                    if (Array.isArray(parsedData)) {
+                        return parsedData;
+                    }
                 }
+            } catch (e) {
+                console.warn("Local Storage 存取受限或資料損毀，將使用預設/記憶體資料。", e);
             }
-            // 如果沒有存檔紀錄，回傳預設的展示資料
-            return [
-                { id: '2330', name: '台積電', type: 'tech', shares: 1000, avgPrice: 750.00, currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
-                { id: '2317', name: '鴻海', type: 'tech', shares: 2000, avgPrice: 165.00, currentPrice: 158.50, dividend: '年配 (7)' },
-                { id: '2454', name: '聯發科', type: 'tech', shares: 1000, avgPrice: 1000.00, currentPrice: 1120.00, dividend: '半年配 (1,7)' },
-                { id: '2603', name: '長榮', type: 'shipping', shares: 1000, avgPrice: 272.00, currentPrice: 215.00, dividend: '年配 (7)' }
-            ];
+            // 如果無法使用 localStorage 或沒有存檔，回傳預設的展示資料
+            return [...defaultPortfolio]; // 回傳複本避免改到常數
         }
 
         function savePortfolio() {
-            localStorage.setItem(PORTFOLIO_STORAGE_KEY, JSON.stringify(portfolio));
+            try {
+                localStorage.setItem(PORTFOLIO_STORAGE_KEY, JSON.stringify(portfolio));
+                console.log("庫存已儲存至 Local Storage");
+            } catch (e) {
+                console.warn("無法將庫存儲存至 Local Storage (可能是瀏覽器隱私設定或沙盒環境阻擋)", e);
+            }
         }
 
         // 初始化載入庫存資料
@@ -446,7 +463,8 @@
             
             if (hasChanges) {
                 renderPortfolio();
-                savePortfolio(); // 確保即時價格變動時也能更新到本機儲存
+                // 在更新價格的同時也將最新價格存入 localStorage
+                savePortfolio(); 
             }
             
             // 更新 UI 燈號
@@ -487,13 +505,15 @@
                 const editBtn = `<button onclick="editStock(${index})" class="text-gray-400 hover:text-blue-400 mx-1 transition-colors" title="編輯"><i class="fa-solid fa-pen"></i></button>`;
                 const deleteBtn = `<button onclick="openDeleteModal(${index})" class="text-gray-400 hover:text-red-400 mx-1 transition-colors" title="刪除"><i class="fa-solid fa-trash"></i></button>`;
 
-                const nameTag = stock.isOdd ? `<span class="bg-gray-700 text-xs px-1 rounded mr-1 text-gray-300">零</span>` : '';
+                // 為了相容可能從舊版 localStorage 讀出的資料，手動判斷是否為零股
+                const isOddLot = stock.isOdd || stock.shares < 1000;
+                const nameTag = isOddLot ? `<span class="bg-gray-700 text-xs px-1 rounded mr-1 text-gray-300">零</span>` : '';
 
                 const tr = document.createElement('tr');
                 tr.className = 'hover:bg-gray-750 bg-gray-800 transition-colors border-b border-gray-700';
                 tr.innerHTML = `
                     <td class="px-4 py-4 font-bold text-white">${nameTag}${stock.id} ${stock.name}</td>
-                    <td class="px-4 py-4 text-center text-blue-300 text-xs">${stock.dividend}</td>
+                    <td class="px-4 py-4 text-center text-blue-300 text-xs">${stock.dividend || '無'}</td>
                     <td class="px-4 py-4 text-right">${fmtNum(stock.shares)}</td>
                     <td class="px-4 py-4 text-right">${fmtPrice(stock.avgPrice)}</td>
                     <td class="px-4 py-4 text-right font-bold transition-colors duration-300" id="price-${stock.id}">${fmtPrice(stock.currentPrice)}</td>
@@ -651,7 +671,7 @@
                 document.getElementById('new-stock-dividend').value = '依公司公告';
                 document.getElementById('new-stock-current').value = '100.00';
                 
-                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無官方資料，請手動輸入';
+                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無官方資料，請手手動輸入';
             }
         }
 
@@ -686,7 +706,7 @@
             document.getElementById('new-stock-id').value = stock.id;
             document.getElementById('new-stock-name').value = stock.name;
             document.getElementById('new-stock-type').value = stock.type;
-            document.getElementById('new-stock-dividend').value = stock.dividend;
+            document.getElementById('new-stock-dividend').value = stock.dividend || '';
             document.getElementById('new-stock-shares').value = stock.shares;
             document.getElementById('new-stock-avg').value = stock.avgPrice;
             document.getElementById('new-stock-current').value = stock.currentPrice.toFixed(2);
@@ -718,15 +738,17 @@
         function submitNewStock(event) {
             event.preventDefault(); 
             
+            const shares = parseInt(document.getElementById('new-stock-shares').value);
+            
             const newStock = {
                 id: document.getElementById('new-stock-id').value,
                 name: document.getElementById('new-stock-name').value,
                 type: document.getElementById('new-stock-type').value,
                 dividend: document.getElementById('new-stock-dividend').value,
-                shares: parseInt(document.getElementById('new-stock-shares').value),
+                shares: shares,
                 avgPrice: parseFloat(document.getElementById('new-stock-avg').value),
                 currentPrice: parseFloat(document.getElementById('new-stock-current').value),
-                isOdd: parseInt(document.getElementById('new-stock-shares').value) < 1000
+                isOdd: shares < 1000 // 明確寫入是否為零股的判斷
             };
             
             if (editStockIndex === -1) {
