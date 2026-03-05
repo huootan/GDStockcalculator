@@ -439,12 +439,11 @@
                 let newPrice = stock.currentPrice;
 
                 if (govInfo) {
-                    // 以政府真實報價為基準點，加入千分之二的微幅視覺震盪來模擬跳動感
-                    const basePrice = govInfo.price;
-                    newPrice = basePrice * (1 + (Math.random() - 0.5) * 0.002);
+                    // 直接使用政府真實報價，不再加入隨機震盪
+                    newPrice = govInfo.price;
                 } else {
-                    // 若無資料，則在原地微幅跳動
-                    newPrice = stock.currentPrice * (1 + (Math.random() - 0.5) * 0.005);
+                    // 若沒連到政府 API 或無資料，則完全不更新（維持現價）
+                    newPrice = stock.currentPrice;
                 }
 
                 if (newPrice !== stock.currentPrice) {
@@ -474,7 +473,7 @@
                 statusBadge.innerHTML = '<i class="fa-solid fa-building-columns mr-1"></i>政府 OpenAPI 連線正常';
             } else {
                 statusBadge.classList.add('bg-yellow-900', 'text-yellow-400');
-                statusBadge.innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>連線異常，啟用模擬報價';
+                statusBadge.innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>連線異常，維持目前報價';
             }
         }
 
@@ -666,12 +665,13 @@
                     setTimeout(() => el.classList.remove('bg-blue-900', 'bg-opacity-40'), 800);
                 });
             } else {
-                document.getElementById('new-stock-name').value = `標的 ${idInput}`;
+                // 查無資料或連線失敗時，不帶入任何模擬假資料，清空讓使用者自己填
+                document.getElementById('new-stock-name').value = '';
                 document.getElementById('new-stock-type').value = 'other';
-                document.getElementById('new-stock-dividend').value = '依公司公告';
-                document.getElementById('new-stock-current').value = '100.00';
+                document.getElementById('new-stock-dividend').value = '';
+                document.getElementById('new-stock-current').value = '';
                 
-                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無官方資料，請手手動輸入';
+                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無官方資料，請手動輸入';
             }
         }
 
