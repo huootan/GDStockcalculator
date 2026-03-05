@@ -162,20 +162,43 @@
                     <div class="mt-2 text-sm text-down font-bold">目前虧損：<span id="modal-loss-amount">--</span></div>
                 </div>
 
-                <div class="mb-4">
-                    <label class="block text-sm text-gray-400 mb-2">請選擇轉換目標 (高殖利率 ETF / 存股)</label>
-                    <select id="target-stock-select" class="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500" onchange="calculateRecovery()">
-                        <option value="0.06">0056 元大高股息 (預估年化殖利率 6%)</option>
-                        <option value="0.065">00878 國泰永續高股息 (預估年化殖利率 6.5%)</option>
-                        <option value="0.07">00713 元大台灣高息低波 (預估年化殖利率 7%)</option>
-                        <option value="0.05">2884 玉山金 (預估年化殖利率 5%)</option>
-                    </select>
+                <div class="mb-4 border-t border-gray-700 pt-4">
+                    <label class="block text-sm text-gray-400 mb-2">請輸入轉換目標股票代號</label>
+                    <div class="flex gap-2 mb-3">
+                        <div class="relative flex-1">
+                            <input type="text" id="target-stock-id" placeholder="例如: 00878, 2884" onblur="fetchTargetStockInfo()" class="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500 transition-colors">
+                            <span id="target-symbol-status" class="absolute right-3 top-2.5 text-xs"></span>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-3 mb-2">
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">目標名稱</label>
+                            <input type="text" id="target-stock-name" readonly class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-300">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">目標現價</label>
+                            <input type="text" id="target-stock-price" readonly class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-300">
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <label class="block text-xs text-gray-400 mb-1 flex justify-between">
+                            <span>預估年化殖利率 (%)</span>
+                            <span class="text-blue-400 cursor-pointer hover:underline" onclick="resetYieldRate()">還原預估值</span>
+                        </label>
+                        <div class="flex items-center">
+                            <input type="number" id="target-yield-rate" step="0.1" value="0.0" oninput="calculateRecovery()" class="w-full bg-gray-900 border border-gray-600 rounded-l-lg px-3 py-2 text-white focus:outline-none focus:border-blue-500 text-right">
+                            <span class="bg-gray-700 border border-gray-600 border-l-0 rounded-r-lg px-3 py-2 text-gray-300">%</span>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">系統帶入歷史平均，您可依據預期手動微調。</p>
+                    </div>
                 </div>
 
-                <div class="mt-6 bg-blue-900 bg-opacity-20 border border-blue-800 rounded-lg p-5 text-center">
+                <div class="mt-6 bg-blue-900 bg-opacity-20 border border-blue-800 rounded-lg p-5 text-center transition-all duration-300" id="recovery-result-box">
                     <p class="text-sm text-gray-300 mb-2">若將剩餘市值全數投入，單靠股息回本約需：</p>
                     <div class="text-4xl font-bold text-blue-400 mb-1" id="recovery-time">-- <span class="text-xl">年</span></div>
-                    <p class="text-xs text-gray-400 mt-2"><i class="fa-solid fa-circle-info"></i> 試算公式：虧損金額 ÷ (剩餘市值 × 目標殖利率)。此為靜態試算，不含股價資本利得與複利效應。</p>
+                    <p class="text-xs text-gray-400 mt-2"><i class="fa-solid fa-circle-info"></i> 試算公式：虧損金額 ÷ (剩餘市值 × 目標殖利率)。</p>
                 </div>
             </div>
             <div class="px-6 py-4 bg-gray-900 border-t border-gray-700 flex justify-end gap-3">
@@ -274,15 +297,17 @@
         const PORTFOLIO_STORAGE_KEY = 'twStockPortfolio';
         const SOURCE_STORAGE_KEY = 'twStockDataSource';
 
-        // 取得目前選定的資料來源 (預設為 openapi)
         let currentDataSource = localStorage.getItem(SOURCE_STORAGE_KEY) || 'openapi';
         document.getElementById('data-source-select').value = currentDataSource;
+        let pollingIntervalId = null; // 紀錄輪詢計時器的 ID
 
         function changeDataSource(source) {
             currentDataSource = source;
             localStorage.setItem(SOURCE_STORAGE_KEY, source);
             
-            // 更換表格標題
+            // 重置冷卻時間，確保切換來源時能立即重新連線
+            errorCooldown = 0; 
+            
             const thTitle = document.getElementById('th-current-price');
             if (thTitle) {
                 if (source === 'openapi') thTitle.innerText = '政府API現價';
@@ -291,12 +316,13 @@
                 else thTitle.innerText = '模擬跳動現價';
             }
 
-            // 立即觸發一次更新以反映變更
             const statusBadge = document.getElementById('sync-status');
             executePricesSync(statusBadge);
+            
+            // 切換來源時，重新啟動智慧動態輪詢
+            startDynamicPolling();
         }
 
-        // 為了確保資料結構一致，給定一個預設資料
         const defaultPortfolio = [
             { id: '2330', name: '台積電', type: 'tech', shares: 1000, avgPrice: 750.00, currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
             { id: '2317', name: '鴻海', type: 'tech', shares: 2000, avgPrice: 165.00, currentPrice: 158.50, dividend: '年配 (7)' },
@@ -304,8 +330,8 @@
             { id: '2603', name: '長榮', type: 'shipping', shares: 1000, avgPrice: 272.00, currentPrice: 215.00, dividend: '年配 (7)' }
         ];
 
-        // 模擬補充資料庫 (包含測試用假價格)
-        const mockStockDatabase = {
+        // 解決重複宣告錯誤
+        const stockDatabase = {
             '2330': { name: '台積電', type: 'tech', currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
             '2317': { name: '鴻海', type: 'tech', currentPrice: 158.50, dividend: '年配 (7)' },
             '2454': { name: '聯發科', type: 'tech', currentPrice: 1120.00, dividend: '半年配 (1,7)' },
@@ -318,31 +344,22 @@
 
         function loadPortfolio() {
             try {
-                const testKey = '__test__';
-                localStorage.setItem(testKey, testKey);
-                localStorage.removeItem(testKey);
-
                 const storedData = localStorage.getItem(PORTFOLIO_STORAGE_KEY);
                 if (storedData) {
                     const parsedData = JSON.parse(storedData);
                     if (Array.isArray(parsedData)) return parsedData;
                 }
-            } catch (e) {
-                console.warn("Local Storage 存取受限，將使用預設/記憶體資料。");
-            }
+            } catch (e) {}
             return [...defaultPortfolio]; 
         }
 
         function savePortfolio() {
             try {
                 localStorage.setItem(PORTFOLIO_STORAGE_KEY, JSON.stringify(portfolio));
-            } catch (e) {
-                console.warn("無法儲存至 Local Storage");
-            }
+            } catch (e) {}
         }
 
         let portfolio = loadPortfolio();
-
         let currentActiveLossStock = null;
         let editStockIndex = -1;
         let deleteStockIndex = -1;
@@ -352,40 +369,57 @@
         let isFetching = false;
         let errorCooldown = 0; 
 
-        // 安全的 JSON 抓取函式
-        async function safeFetchJSON(url) {
+        // --- 強健的網路連線引擎 (三段式無縫備援) ---
+        async function safeFetchJSON(url, isLarge = false) {
+            const timeout = isLarge ? 12000 : 6000; // 針對政府大檔拉長讀取時間
+
+            // 第一階段：直接存取 (對 OpenAPI 有效)
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 6000);
-                const response = await window.fetch(url, { signal: controller.signal });
-                clearTimeout(timeoutId);
-                
-                if (response.ok) return await response.json();
-            } catch (error) {}
-            
+                const id = setTimeout(() => controller.abort(), timeout);
+                const res = await window.fetch(url, { signal: controller.signal });
+                clearTimeout(id);
+                if (res.ok) return await res.json();
+            } catch (e) { /* 靜默失敗 */ }
+
+            // 第二階段：透過 CodeTabs 代理 (高成功率，解決 CORS)
             try {
-                const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-                const controller2 = new AbortController();
-                const timeoutId2 = setTimeout(() => controller2.abort(), 6000);
-                const response2 = await window.fetch(proxyUrl, { signal: controller2.signal });
-                clearTimeout(timeoutId2);
-                
-                if (response2.ok) return await response2.json();
-            } catch (error) {}
-            
-            return null;
+                const controller = new AbortController();
+                const id = setTimeout(() => controller.abort(), timeout);
+                const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`;
+                const res = await window.fetch(proxyUrl, { signal: controller.signal });
+                clearTimeout(id);
+                if (res.ok) return await res.json();
+            } catch (e) { /* 靜默失敗 */ }
+
+            // 第三階段：透過 AllOrigins 代理擷取 (最終備援)
+            try {
+                const controller = new AbortController();
+                const id = setTimeout(() => controller.abort(), timeout);
+                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+                const res = await window.fetch(proxyUrl, { signal: controller.signal });
+                clearTimeout(id);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.contents) {
+                        try { return JSON.parse(data.contents); } 
+                        catch(err) { return data.contents; }
+                    }
+                }
+            } catch (e) { /* 完全失敗 */ }
+
+            return null; // 回傳 null，不噴出紅字錯誤
         }
 
         async function fetchGovernmentData() {
             const now = Date.now();
-            
             if (govDataCache && (now - lastFetchTime < 60000)) return govDataCache;
             if (now < errorCooldown || isFetching) return govDataCache || {};
 
             isFetching = true;
 
-            const tseData = await safeFetchJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
-            const otcData = await safeFetchJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes');
+            const tseData = await safeFetchJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', true);
+            const otcData = await safeFetchJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes', true);
 
             const priceMap = {};
             let hasData = false;
@@ -422,80 +456,112 @@
                 errorCooldown = 0; 
                 return priceMap;
             } else {
-                // 連線完全失敗：啟動 30 秒冷卻期
                 errorCooldown = now + 30000;
                 return govDataCache || {};
             }
         }
 
-        // --- 新增：獲取 TWSE MIS 即時報價 (批次) ---
         async function fetchTWSEBatchData(stockIds) {
             if (!stockIds || stockIds.length === 0) return {};
+            const now = Date.now();
+            if (now < errorCooldown) return {};
+
             try {
                 const exChList = stockIds.map(id => `tse_${id}.tw|otc_${id}.tw`).join('|');
-                const targetUrl = encodeURIComponent(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${exChList}&json=1&delay=0&_=${Date.now()}`);
-                const proxyUrl = `https://api.allorigins.win/raw?url=${targetUrl}`;
+                const targetUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${exChList}&json=1&delay=0&_=${Date.now()}`;
 
-                const data = await safeFetchJSON(proxyUrl);
+                const data = await safeFetchJSON(targetUrl);
                 const results = {};
+                
                 if (data && data.msgArray) {
                     data.msgArray.forEach(info => {
                         let currentPrice = parseFloat(info.z);
                         if (isNaN(currentPrice) || info.z === '-') currentPrice = parseFloat(info.y);
                         results[info.c] = { name: info.n, price: currentPrice };
                     });
+                    errorCooldown = 0;
+                    return results;
                 }
-                return results;
+                errorCooldown = now + 30000;
+                return {};
             } catch (e) {
+                errorCooldown = Date.now() + 30000;
                 return {};
             }
         }
 
-        // --- 新增：獲取 Yahoo Finance 即時報價 (批次) ---
         async function fetchYahooBatchData(stockIds) {
             if (!stockIds || stockIds.length === 0) return {};
-            try {
-                // Yahoo Finance 台股後綴有 .TW (上市) 與 .TWO (上櫃)，保險起見兩者皆查
-                const symbols = stockIds.map(id => `${id}.TW,${id}.TWO`).join(',');
-                const targetUrl = encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}`);
-                const proxyUrl = `https://api.allorigins.win/raw?url=${targetUrl}`;
+            const now = Date.now();
+            if (now < errorCooldown) return {};
 
-                const data = await safeFetchJSON(proxyUrl);
+            try {
+                const symbols = stockIds.map(id => `${id}.TW,${id}.TWO`).join(',');
+                const targetUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${symbols}`;
+                
+                const data = await safeFetchJSON(targetUrl);
                 const results = {};
 
                 if (data && data.quoteResponse && data.quoteResponse.result) {
                     data.quoteResponse.result.forEach(item => {
-                        const baseId = item.symbol.split('.')[0]; // 移除後綴取純代號
+                        const baseId = item.symbol.split('.')[0]; 
                         if (item.regularMarketPrice) {
                             results[baseId] = { name: item.shortName || baseId, price: item.regularMarketPrice };
                         }
                     });
+                    errorCooldown = 0;
+                    return results;
                 }
-                return results;
+                errorCooldown = now + 30000;
+                return {};
             } catch (e) {
+                errorCooldown = Date.now() + 30000;
                 return {};
             }
         }
 
-        // 定時更新機制 (改為 8 秒 UI 更新頻率)
-        async function syncRealTimePrices() {
+        // --- 智慧動態輪詢 (Smart Dynamic Polling) ---
+        function startDynamicPolling() {
+            if (pollingIntervalId) {
+                clearInterval(pollingIntervalId);
+            }
+
             const statusBadge = document.getElementById('sync-status');
             
-            // 初始標題設定
-            const thTitle = document.getElementById('th-current-price');
-            if (thTitle) thTitle.innerText = currentDataSource === 'openapi' ? '政府API現價' : '模擬跳動現價';
+            // 決定輪詢頻率
+            let interval = 8000; // 預設 8 秒 (適用於即時資料源)
             
-            await executePricesSync(statusBadge);
+            if (currentDataSource === 'openapi') {
+                // 政府 API 每天只更新一次收盤價，過度頻繁請求會耗費資源且容易被阻擋。
+                // 改為每 5 分鐘 (300000 毫秒) 檢查一次，適合盤後記帳。
+                interval = 300000; 
+            }
 
-            setInterval(async () => {
+            pollingIntervalId = setInterval(async () => {
                 await executePricesSync(statusBadge);
-            }, 8000); 
+            }, interval);
+        }
+
+        // 初始系統啟動入口
+        async function initSystem() {
+            const statusBadge = document.getElementById('sync-status');
+            const thTitle = document.getElementById('th-current-price');
+            
+            if (thTitle) {
+                if (currentDataSource === 'openapi') thTitle.innerText = '政府API現價';
+                else if (currentDataSource === 'twse_mis') thTitle.innerText = 'TWSE即時價';
+                else if (currentDataSource === 'yahoo') thTitle.innerText = 'Yahoo即時價';
+                else thTitle.innerText = '模擬跳動現價';
+            }
+            
+            renderPortfolio();
+            await executePricesSync(statusBadge);
+            startDynamicPolling();
         }
 
         async function executePricesSync(statusBadge) {
             if (portfolio.length === 0) return;
             
-            // 根據不同資料來源執行不同邏輯
             if (currentDataSource === 'openapi' || currentDataSource === 'twse_mis' || currentDataSource === 'yahoo') {
                 statusBadge.classList.remove('bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400', 'bg-purple-900', 'text-purple-400');
                 statusBadge.classList.add('bg-blue-900', 'text-blue-400');
@@ -504,7 +570,6 @@
                 const uniqueStockIds = [...new Set(portfolio.map(s => s.id))];
                 let priceMap = {};
                 
-                // 動態派發請求
                 if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData();
                 else if (currentDataSource === 'twse_mis') priceMap = await fetchTWSEBatchData(uniqueStockIds);
                 else if (currentDataSource === 'yahoo') priceMap = await fetchYahooBatchData(uniqueStockIds);
@@ -517,7 +582,7 @@
                     let newPrice = stock.currentPrice;
 
                     if (info) {
-                        newPrice = info.price; // 直接使用真實報價，無震盪
+                        newPrice = info.price; // 使用真實報價
                     }
 
                     if (newPrice !== stock.currentPrice) {
@@ -551,14 +616,12 @@
                 }
 
             } else if (currentDataSource === 'mock') {
-                // 模擬報價模式 (會隨機跳動)
                 statusBadge.classList.remove('bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400', 'bg-blue-900', 'text-blue-400');
                 statusBadge.classList.add('bg-purple-900', 'text-purple-400');
                 statusBadge.innerHTML = '<i class="fa-solid fa-arrows-rotate fa-spin mr-1"></i>模擬報價跳動中...';
 
                 let hasChanges = false;
                 for (let stock of portfolio) {
-                    // 以歷史或預設價格為基底微幅震盪，產生看盤假象
                     const basePrice = stock.currentPrice || stock.avgPrice || 100;
                     const newPrice = basePrice * (1 + (Math.random() - 0.5) * 0.01);
                     
@@ -574,10 +637,7 @@
                     }
                 }
 
-                if (hasChanges) {
-                    renderPortfolio();
-                    // 不將模擬跳動的結果存入 Local Storage，以免污染真實成本紀錄
-                }
+                if (hasChanges) renderPortfolio();
 
                 setTimeout(() => {
                     statusBadge.innerHTML = '<i class="fa-solid fa-vial mr-1"></i>模擬測試環境 (隨機跳動)';
@@ -656,6 +716,8 @@
         }
 
         // --- 換股回本試算邏輯 ---
+        let currentTargetYield = 0; // 儲存系統帶入的原始殖利率
+
         function openRecoveryModal(stockIndex) {
             currentActiveLossStock = portfolio[stockIndex];
             const stock = currentActiveLossStock;
@@ -668,6 +730,14 @@
             document.getElementById('modal-market-value').textContent = `TWD ${fmtNum(value)}`;
             document.getElementById('modal-loss-amount').textContent = `- ${fmtNum(loss)}`;
             
+            // 清空目標欄位
+            document.getElementById('target-stock-id').value = '';
+            document.getElementById('target-stock-name').value = '';
+            document.getElementById('target-stock-price').value = '';
+            document.getElementById('target-yield-rate').value = '0.0';
+            document.getElementById('target-symbol-status').innerHTML = '';
+            document.getElementById('recovery-time').innerHTML = '-- <span class="text-xl text-blue-300">年</span>';
+            
             const modal = document.getElementById('recovery-modal');
             const content = document.getElementById('modal-content');
             
@@ -676,8 +746,6 @@
                 modal.classList.remove('opacity-0');
                 content.classList.remove('scale-95');
             }, 10);
-
-            calculateRecovery(); 
         }
 
         function closeModal() {
@@ -693,6 +761,66 @@
             }, 300);
         }
 
+        // 模擬的歷史平均殖利率資料庫 (實務上需串接財報 API)
+        const mockYieldDatabase = {
+            '0056': 6.5,
+            '00878': 6.2,
+            '00713': 7.1,
+            '00929': 8.0,
+            '2884': 5.2,
+            '2891': 5.5,
+            '2330': 2.5,
+            '2454': 6.0
+        };
+
+        async function fetchTargetStockInfo() {
+            const idInput = document.getElementById('target-stock-id').value.trim();
+            const symbolStatus = document.getElementById('target-symbol-status');
+            
+            if (!idInput) return;
+
+            symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i>';
+
+            let priceMap = {};
+            if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData();
+            else if (currentDataSource === 'twse_mis') priceMap = await fetchTWSEBatchData([idInput]);
+            else if (currentDataSource === 'yahoo') priceMap = await fetchYahooBatchData([idInput]);
+
+            const info = priceMap[idInput] || (currentDataSource === 'mock' ? stockDatabase[idInput] : null);
+
+            if (info) {
+                // 帶入名稱與現價
+                document.getElementById('target-stock-name').value = info.name;
+                const price = info.price || info.currentPrice;
+                document.getElementById('target-stock-price').value = price;
+                
+                // 帶入模擬殖利率，若查無則預設 4%
+                currentTargetYield = mockYieldDatabase[idInput] || 4.0;
+                document.getElementById('target-yield-rate').value = currentTargetYield.toFixed(1);
+                
+                symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i>';
+                
+                // 觸發重新計算
+                calculateRecovery();
+                
+                // 視覺提示
+                document.getElementById('recovery-result-box').classList.add('bg-blue-800', 'bg-opacity-40');
+                setTimeout(() => document.getElementById('recovery-result-box').classList.remove('bg-blue-800', 'bg-opacity-40'), 800);
+
+            } else {
+                document.getElementById('target-stock-name').value = '查無資料';
+                document.getElementById('target-stock-price').value = '--';
+                document.getElementById('target-yield-rate').value = '0.0';
+                symbolStatus.innerHTML = '<i class="fa-solid fa-xmark text-red-400"></i>';
+                document.getElementById('recovery-time').innerHTML = '-- <span class="text-xl text-blue-300">年</span>';
+            }
+        }
+
+        function resetYieldRate() {
+            document.getElementById('target-yield-rate').value = currentTargetYield.toFixed(1);
+            calculateRecovery();
+        }
+
         function calculateRecovery() {
             if(!currentActiveLossStock) return;
             const stock = currentActiveLossStock;
@@ -700,7 +828,15 @@
             const value = stock.shares * stock.currentPrice;
             const loss = cost - value; 
             
-            const yieldRate = parseFloat(document.getElementById('target-stock-select').value);
+            // 讀取使用者介面上的殖利率 (%)
+            const yieldRatePercent = parseFloat(document.getElementById('target-yield-rate').value);
+            
+            if (isNaN(yieldRatePercent) || yieldRatePercent <= 0) {
+                document.getElementById('recovery-time').innerHTML = '-- <span class="text-xl text-blue-300">年</span>';
+                return;
+            }
+
+            const yieldRate = yieldRatePercent / 100;
             const annualDividend = value * yieldRate;
             const yearsToRecover = loss / annualDividend;
             
@@ -731,8 +867,7 @@
             }, 1000);
         }
 
-
-        // --- 自動帶入股票資訊 (依據選擇的來源) ---
+        // --- 自動帶入真實股票資訊 ---
         async function autoFillStockInfo() {
             const idInput = document.getElementById('new-stock-id').value.trim();
             const symbolStatus = document.getElementById('symbol-status');
@@ -750,9 +885,9 @@
                 const info = priceMap[idInput];
 
                 if (info) {
-                    document.getElementById('new-stock-name').value = info.name || mockStockDatabase[idInput]?.name || '';
-                    document.getElementById('new-stock-type').value = mockStockDatabase[idInput]?.type || 'other';
-                    document.getElementById('new-stock-dividend').value = mockStockDatabase[idInput]?.dividend || '依公司公告';
+                    document.getElementById('new-stock-name').value = info.name || stockDatabase[idInput]?.name || '';
+                    document.getElementById('new-stock-type').value = stockDatabase[idInput]?.type || 'other';
+                    document.getElementById('new-stock-dividend').value = stockDatabase[idInput]?.dividend || '依公司公告';
                     document.getElementById('new-stock-current').value = info.price;
                     
                     if(symbolStatus) {
@@ -774,10 +909,9 @@
                     if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無連線資料，請手動輸入';
                 }
             } else if (currentDataSource === 'mock') {
-                // 模擬環境帶入假資料
                 if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-check text-purple-400"></i> 模擬資料帶入成功';
                 
-                const mockInfo = mockStockDatabase[idInput];
+                const mockInfo = stockDatabase[idInput];
                 if (mockInfo) {
                     document.getElementById('new-stock-name').value = mockInfo.name;
                     document.getElementById('new-stock-type').value = mockInfo.type;
@@ -871,7 +1005,7 @@
                 shares: shares,
                 avgPrice: parseFloat(document.getElementById('new-stock-avg').value),
                 currentPrice: parseFloat(document.getElementById('new-stock-current').value),
-                isOdd: shares < 1000 // 明確寫入是否為零股的判斷
+                isOdd: shares < 1000 
             };
             
             if (editStockIndex === -1) {
@@ -880,7 +1014,6 @@
                 portfolio[editStockIndex] = newStock;
             }
             
-            // 將更新後的資料儲存到瀏覽器本機端
             savePortfolio();
             
             renderPortfolio();
@@ -927,7 +1060,6 @@
             if (deleteStockIndex > -1) {
                 portfolio.splice(deleteStockIndex, 1); 
                 
-                // 將刪除後的資料狀態儲存到瀏覽器本機端
                 savePortfolio();
                 
                 renderPortfolio(); 
@@ -1016,9 +1148,9 @@
             document.getElementById('clock').textContent = now.toLocaleString('zh-TW', { hour12: false });
         }
         
-        // 啟動主程式
-        renderPortfolio();
-        syncRealTimePrices(); // 啟動定時連線
+        // 系統初始啟動
+        initSystem();
+
     </script>
 </body>
 </html>
