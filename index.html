@@ -21,8 +21,8 @@
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
         
         /* 股價閃爍動畫 */
-        @keyframes flash-up { 0% { background-color: rgba(255, 74, 74, 0.4); } 100% { background-color: transparent; } }
-        @keyframes flash-down { 0% { background-color: rgba(0, 230, 118, 0.4); } 100% { background-color: transparent; } }
+        @keyframes flash-up { 0% { background-color: rgba(255, 74, 74, 0.5); } 100% { background-color: transparent; } }
+        @keyframes flash-down { 0% { background-color: rgba(0, 230, 118, 0.5); } 100% { background-color: transparent; } }
         .price-flash-up { animation: flash-up 1s ease-out; }
         .price-flash-down { animation: flash-down 1s ease-out; }
     </style>
@@ -274,71 +274,67 @@
         let editStockIndex = -1;
         let deleteStockIndex = -1;
 
-        // --- 核心：真實 TWSE API 串接邏輯 (加入優雅降級機制) ---
-        async function fetchTWSEData(stockId, fallbackPrice) {
+        // --- 核心更新：使用「API Batching (批次請求)」與「雙重 Proxy 備援」來解決被阻擋問題 ---
+        async function fetchTWSEBatchData(stockIds) {
+            if (!stockIds || stockIds.length === 0) return {};
             try {
-                // 設定請求超時機制，防止 public proxy 掛掉造成應用程式卡死
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 4000);
+                // 技巧：同時請求 tse (上市) 與 otc (上櫃)，TWSE API 會自動忽略不存在的組合。
+                // 這樣可以把所有的股票「合併成一個網址」發送，大幅降低請求次數。
+                const exChList = stockIds.map(id => `tse_${id}.tw|otc_${id}.tw`).join('|');
+                const targetUrl = encodeURIComponent(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${exChList}&json=1&delay=0&_=${Date.now()}`);
 
-                let targetUrl = encodeURIComponent(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_${stockId}.tw&json=1&delay=0&_=${Date.now()}`);
-                let proxyUrl = `https://api.allorigins.win/get?url=${targetUrl}`;
-                
-                let response = await fetch(proxyUrl, { signal: controller.signal });
-                clearTimeout(timeoutId);
+                // 設定雙重備援 Proxy，若第一個死掉會自動無縫切換第二個
+                const proxies = [
+                    `https://api.allorigins.win/raw?url=${targetUrl}`,
+                    `https://corsproxy.io/?${targetUrl}`
+                ];
 
-                if (!response.ok) throw new Error('Proxy 發生異常');
-                let data = await response.json();
-                let twseData = JSON.parse(data.contents);
-
-                // 若上市查無資料，改查上櫃
-                if (!twseData.msgArray || twseData.msgArray.length === 0) {
-                    const controllerOtc = new AbortController();
-                    const timeoutIdOtc = setTimeout(() => controllerOtc.abort(), 4000);
-                    
-                    targetUrl = encodeURIComponent(`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_${stockId}.tw&json=1&delay=0&_=${Date.now()}`);
-                    proxyUrl = `https://api.allorigins.win/get?url=${targetUrl}`;
-                    
-                    response = await fetch(proxyUrl, { signal: controllerOtc.signal });
-                    clearTimeout(timeoutIdOtc);
-                    
-                    if (!response.ok) throw new Error('Proxy 發生異常 (OTC)');
-                    data = await response.json();
-                    twseData = JSON.parse(data.contents);
+                let response = null;
+                for (let proxy of proxies) {
+                    try {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 4000); // 4秒超時
+                        let res = await fetch(proxy, { signal: controller.signal });
+                        clearTimeout(timeoutId);
+                        
+                        if (res.ok) {
+                            response = res;
+                            break; // 成功取得資料，跳出備援迴圈
+                        }
+                    } catch (e) {
+                        console.warn('Proxy 延遲或阻擋，切換備援路線...');
+                        continue;
+                    }
                 }
+
+                if (!response) throw new Error('所有 Proxy 皆無法連線');
+
+                let twseData = await response.json();
+                const results = {};
 
                 if (twseData.msgArray && twseData.msgArray.length > 0) {
-                    const info = twseData.msgArray[0];
-                    let currentPrice = parseFloat(info.z);
-                    if (isNaN(currentPrice) || info.z === '-') {
-                        currentPrice = parseFloat(info.y);
-                    }
-
-                    return {
-                        id: info.c,
-                        name: info.n,
-                        currentPrice: currentPrice,
-                        type: mockStockDatabase[stockId]?.type || 'other',
-                        dividend: mockStockDatabase[stockId]?.dividend || '依公司公告',
-                        isSimulated: false
-                    };
+                    twseData.msgArray.forEach(info => {
+                        let currentPrice = parseFloat(info.z); // z: 最新成交價
+                        if (isNaN(currentPrice) || info.z === '-') {
+                            currentPrice = parseFloat(info.y); // 若開盤無成交則取 y: 昨收價
+                        }
+                        results[info.c] = {
+                            id: info.c,
+                            name: info.n,
+                            currentPrice: currentPrice,
+                            isSimulated: false
+                        };
+                    });
                 }
-                throw new Error('TWSE 查無此資料');
+                return results;
             } catch (error) {
-                // 優雅降級：若遭遇 CORS 阻擋或請求超時，攔截錯誤不報紅字，並啟用模擬數據
-                const simulatedPrice = fallbackPrice ? fallbackPrice * (1 + (Math.random() - 0.5) * 0.005) : 100;
-                return {
-                    id: stockId,
-                    name: mockStockDatabase[stockId]?.name || `標的 ${stockId}`,
-                    currentPrice: simulatedPrice,
-                    type: mockStockDatabase[stockId]?.type || 'other',
-                    dividend: mockStockDatabase[stockId]?.dividend || '依公司公告',
-                    isSimulated: true
-                };
+                // 攔截所有網路錯誤，避免 Console 洗版
+                console.warn('TWSE API 暫時無法連線，已準備降級處理。');
+                return {}; 
             }
         }
 
-        // 定時向 TWSE 請求最新報價 (每 15 秒更新一次)
+        // 定時向 TWSE 請求最新報價 (改為每 3 秒更新一次，提升即時感)
         async function syncRealTimePrices() {
             const statusBadge = document.getElementById('sync-status');
             
@@ -346,13 +342,13 @@
 
             setInterval(async () => {
                 await executePricesSync(statusBadge);
-            }, 15000); 
+            }, 3000); 
         }
 
         async function executePricesSync(statusBadge) {
             if (portfolio.length === 0) return;
             
-            // 變更 UI 狀態為更新中
+            // 狀態列更新
             statusBadge.classList.remove('bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400');
             statusBadge.classList.add('bg-blue-900', 'text-blue-400');
             statusBadge.innerHTML = '<i class="fa-solid fa-arrows-rotate fa-spin mr-1"></i>報價連線中...';
@@ -360,20 +356,33 @@
             let hasChanges = false;
             let anyRealData = false;
             
-            // 逐一更新庫存中的股票
+            // 提取清單中所有不重複的股票代號，進行「批次請求 (Batch Request)」
+            const uniqueStockIds = [...new Set(portfolio.map(s => s.id))];
+            const realDataMap = await fetchTWSEBatchData(uniqueStockIds);
+            
+            // 更新畫面
             for (let stock of portfolio) {
-                const realData = await fetchTWSEData(stock.id, stock.currentPrice);
-                if (realData && realData.currentPrice !== stock.currentPrice) {
-                    if (!realData.isSimulated) anyRealData = true;
+                const realData = realDataMap[stock.id];
+                let newPrice = stock.currentPrice;
 
+                if (realData) {
+                    newPrice = realData.currentPrice;
+                    anyRealData = true;
+                } else {
+                    // 若遇假日或 API 異常的降級機制：模擬微幅跳動以展示 UI 動畫
+                    newPrice = stock.currentPrice * (1 + (Math.random() - 0.5) * 0.005);
+                }
+
+                // 只有當股價有變動時，才觸發閃爍與重新計算
+                if (newPrice !== stock.currentPrice) {
                     const oldPrice = stock.currentPrice;
-                    stock.currentPrice = realData.currentPrice;
+                    stock.currentPrice = newPrice;
                     hasChanges = true;
                     
                     const priceTd = document.getElementById(`price-${stock.id}`);
                     if(priceTd) {
                         priceTd.classList.remove('price-flash-up', 'price-flash-down');
-                        void priceTd.offsetWidth; // 觸發重繪
+                        void priceTd.offsetWidth; // 觸發瀏覽器重繪
                         priceTd.classList.add(stock.currentPrice >= oldPrice ? 'price-flash-up' : 'price-flash-down');
                     }
                 }
@@ -381,7 +390,7 @@
             
             if (hasChanges) renderPortfolio();
             
-            // 依據是否成功取得真實資料，更新連線狀態燈號
+            // 依據是否成功取得真實資料更新燈號
             statusBadge.classList.remove('bg-blue-900', 'text-blue-400');
             if (anyRealData) {
                 statusBadge.classList.add('bg-green-900', 'text-green-400');
@@ -549,7 +558,7 @@
             '00878': { name: '國泰永續高股息', type: 'etf', dividend: '季配 (2,5,8,11)' },
         };
 
-        // --- 自動帶入真實股票資訊 ---
+        // --- 自動帶入真實股票資訊 (改用批次處理函式) ---
         async function autoFillStockInfo() {
             const idInput = document.getElementById('new-stock-id').value.trim();
             const symbolStatus = document.getElementById('symbol-status');
@@ -558,22 +567,18 @@
 
             if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i> 報價連線中...';
 
-            const fallbackPrice = mockStockDatabase[idInput]?.currentPrice || 100;
-            const realData = await fetchTWSEData(idInput, fallbackPrice);
+            // 呼叫批次處理 API (傳入單一陣列)
+            const realDataMap = await fetchTWSEBatchData([idInput]);
+            const realData = realDataMap[idInput];
 
             if (realData) {
                 document.getElementById('new-stock-name').value = realData.name;
-                document.getElementById('new-stock-type').value = realData.type;
-                document.getElementById('new-stock-dividend').value = realData.dividend;
-                // 若為模擬報價則提供適當的小數點呈現
-                document.getElementById('new-stock-current').value = realData.isSimulated ? realData.currentPrice.toFixed(2) : realData.currentPrice;
+                document.getElementById('new-stock-type').value = mockStockDatabase[idInput]?.type || 'other';
+                document.getElementById('new-stock-dividend').value = mockStockDatabase[idInput]?.dividend || '依公司公告';
+                document.getElementById('new-stock-current').value = realData.currentPrice;
                 
                 if(symbolStatus) {
-                    if (realData.isSimulated) {
-                        symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> API限制，帶入模擬報價';
-                    } else {
-                        symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> TWSE 報價帶入成功';
-                    }
+                    symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> TWSE 報價帶入成功';
                 }
                 
                 const fields = ['new-stock-name', 'new-stock-type', 'new-stock-dividend', 'new-stock-current'];
@@ -583,7 +588,16 @@
                     setTimeout(() => el.classList.remove('bg-blue-900', 'bg-opacity-40'), 800);
                 });
             } else {
-                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> 查無代號，請手動輸入';
+                // 找不到資料時的降級處理
+                const fallbackPrice = mockStockDatabase[idInput]?.currentPrice || 100;
+                const simulatedPrice = fallbackPrice * (1 + (Math.random() - 0.5) * 0.005);
+                
+                document.getElementById('new-stock-name').value = mockStockDatabase[idInput]?.name || `標的 ${idInput}`;
+                document.getElementById('new-stock-type').value = mockStockDatabase[idInput]?.type || 'other';
+                document.getElementById('new-stock-dividend').value = mockStockDatabase[idInput]?.dividend || '依公司公告';
+                document.getElementById('new-stock-current').value = simulatedPrice.toFixed(2);
+                
+                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400"></i> API限制，帶入模擬報價';
             }
         }
 
