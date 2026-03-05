@@ -263,69 +263,139 @@
         const fmtNum = (num) => num.toLocaleString('en-US', { maximumFractionDigits: 0 });
         const fmtPrice = (num) => num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-        let portfolio = [
-            { id: '2330', name: '台積電', type: 'tech', shares: 1000, avgPrice: 750.00, currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
-            { id: '2317', name: '鴻海', type: 'tech', shares: 2000, avgPrice: 165.00, currentPrice: 158.50, dividend: '年配 (7)' },
-            { id: '2454', name: '聯發科', type: 'tech', shares: 1000, avgPrice: 1000.00, currentPrice: 1120.00, dividend: '半年配 (1,7)' },
-            { id: '2603', name: '長榮', type: 'shipping', shares: 1000, avgPrice: 272.00, currentPrice: 215.00, dividend: '年配 (7)' }
-        ];
+        // --- 本機儲存 (Local Storage) 機制 ---
+        const PORTFOLIO_STORAGE_KEY = 'twStockPortfolio';
+
+        function loadPortfolio() {
+            const storedData = localStorage.getItem(PORTFOLIO_STORAGE_KEY);
+            if (storedData) {
+                try {
+                    return JSON.parse(storedData);
+                } catch (e) {
+                    console.error("無法解析儲存的庫存資料", e);
+                }
+            }
+            // 如果沒有存檔紀錄，回傳預設的展示資料
+            return [
+                { id: '2330', name: '台積電', type: 'tech', shares: 1000, avgPrice: 750.00, currentPrice: 855.00, dividend: '季配 (3,6,9,12)' },
+                { id: '2317', name: '鴻海', type: 'tech', shares: 2000, avgPrice: 165.00, currentPrice: 158.50, dividend: '年配 (7)' },
+                { id: '2454', name: '聯發科', type: 'tech', shares: 1000, avgPrice: 1000.00, currentPrice: 1120.00, dividend: '半年配 (1,7)' },
+                { id: '2603', name: '長榮', type: 'shipping', shares: 1000, avgPrice: 272.00, currentPrice: 215.00, dividend: '年配 (7)' }
+            ];
+        }
+
+        function savePortfolio() {
+            localStorage.setItem(PORTFOLIO_STORAGE_KEY, JSON.stringify(portfolio));
+        }
+
+        // 初始化載入庫存資料
+        let portfolio = loadPortfolio();
 
         let currentActiveLossStock = null;
         let editStockIndex = -1;
         let deleteStockIndex = -1;
 
-        // --- 核心更新：直接串接台灣政府開放資料平台 OpenAPI (無 CORS 限制) ---
+        // --- 核心更新：使用安全封裝的 fetch 防止 Console 報錯洗版 ---
         let govDataCache = null;
         let lastFetchTime = 0;
+        let isFetching = false;
+        let errorCooldown = 0; // 錯誤冷卻時間
+
+        // 安全的 JSON 抓取函式 (靜默處理所有網路錯誤)
+        async function safeFetchJSON(url) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 6000);
+                const response = await window.fetch(url, { signal: controller.signal });
+                clearTimeout(timeoutId);
+                
+                if (response.ok) {
+                    return await response.json();
+                }
+            } catch (error) {
+                // 靜默攔截直接 fetch 的錯誤
+            }
+            
+            // 備援方案：如果直連政府 API 失敗 (例如受到瀏覽器 CORS 嚴格限制)
+            // 則透過備援 Proxy 嘗試抓取
+            try {
+                const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+                const controller2 = new AbortController();
+                const timeoutId2 = setTimeout(() => controller2.abort(), 6000);
+                const response2 = await window.fetch(proxyUrl, { signal: controller2.signal });
+                clearTimeout(timeoutId2);
+                
+                if (response2.ok) {
+                    return await response2.json();
+                }
+            } catch (error) {
+                // 靜默攔截 Proxy 的錯誤
+            }
+            
+            return null; // 完全失敗時回傳 null，避免拋出 Exception
+        }
 
         async function fetchGovernmentData() {
             const now = Date.now();
-            // 為避免頻繁請求大檔導致客戶端卡頓，設定 60 秒快取大表
+            
+            // 正常快取：60秒內直接回傳，減輕政府伺服器壓力
             if (govDataCache && (now - lastFetchTime < 60000)) {
                 return govDataCache;
             }
 
-            try {
-                // 直接使用瀏覽器 fetch 政府 OpenAPI，天生支援跨域
-                const [tseRes, otcRes] = await Promise.all([
-                    fetch('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL'), // 上市
-                    fetch('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes')      // 上櫃
-                ]);
+            // 錯誤冷卻保護：如果剛才連線失敗，30秒內不再嘗試發送請求，防止 DDoS 與報錯洗版
+            if (now < errorCooldown || isFetching) {
+                return govDataCache || {};
+            }
 
-                const tseData = await tseRes.json();
-                const otcData = await otcRes.json();
+            isFetching = true;
 
-                const priceMap = {};
+            // 抓取上市與上櫃資料
+            const tseData = await safeFetchJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
+            const otcData = await safeFetchJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes');
 
-                // 處理上市資料 (欄位: ClosingPrice)
+            const priceMap = {};
+            let hasData = false;
+
+            if (tseData && Array.isArray(tseData)) {
                 tseData.forEach(item => {
-                    const priceStr = item.ClosingPrice.replace(/,/g, ''); // 移除可能的逗號
-                    const price = parseFloat(priceStr);
-                    if (!isNaN(price)) {
-                        priceMap[item.Code] = { name: item.Name, price: price };
+                    if (item.ClosingPrice) {
+                        const price = parseFloat(item.ClosingPrice.replace(/,/g, ''));
+                        if (!isNaN(price)) {
+                            priceMap[item.Code] = { name: item.Name, price: price };
+                            hasData = true;
+                        }
                     }
                 });
+            }
 
-                // 處理上櫃資料 (欄位: Close)
+            if (otcData && Array.isArray(otcData)) {
                 otcData.forEach(item => {
-                    const priceStr = item.Close.replace(/,/g, '');
-                    const price = parseFloat(priceStr);
-                    if (!isNaN(price)) {
-                        priceMap[item.SecuritiesCompanyCode] = { name: item.CompanyName, price: price };
+                    if (item.Close) {
+                        const price = parseFloat(item.Close.replace(/,/g, ''));
+                        if (!isNaN(price)) {
+                            priceMap[item.SecuritiesCompanyCode] = { name: item.CompanyName, price: price };
+                            hasData = true;
+                        }
                     }
                 });
+            }
 
+            isFetching = false;
+
+            if (hasData) {
                 govDataCache = priceMap;
                 lastFetchTime = now;
+                errorCooldown = 0; // 成功獲取則解除冷卻
                 return priceMap;
-
-            } catch (error) {
-                console.error('政府 OpenAPI 連線異常:', error);
-                return govDataCache || {}; 
+            } else {
+                // 連線完全失敗：啟動 30 秒冷卻期
+                errorCooldown = now + 30000;
+                return govDataCache || {};
             }
         }
 
-        // 定時更新機制 (維持 3 秒 UI 更新頻率)
+        // 定時更新機制 (改為 8 秒 UI 更新頻率)
         async function syncRealTimePrices() {
             const statusBadge = document.getElementById('sync-status');
             
@@ -333,23 +403,18 @@
 
             setInterval(async () => {
                 await executePricesSync(statusBadge);
-            }, 3000); 
+            }, 8000); 
         }
 
         async function executePricesSync(statusBadge) {
             if (portfolio.length === 0) return;
             
-            // 狀態列更新
-            statusBadge.classList.remove('bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400');
-            statusBadge.classList.add('bg-blue-900', 'text-blue-400');
-            statusBadge.innerHTML = '<i class="fa-solid fa-arrows-rotate fa-spin mr-1"></i>政府資料同步中...';
-            
-            let hasChanges = false;
-            let anyRealData = false;
-            
-            // 獲取政府真實報價字典
+            // 獲取政府真實報價字典 (背後由快取或冷卻機制保護)
             const priceMap = await fetchGovernmentData();
-            if (Object.keys(priceMap).length > 0) anyRealData = true;
+            
+            // 判斷連線狀態
+            let isConnected = Object.keys(priceMap).length > 0;
+            let hasChanges = false;
             
             // 更新畫面
             for (let stock of portfolio) {
@@ -357,12 +422,11 @@
                 let newPrice = stock.currentPrice;
 
                 if (govInfo) {
-                    // 備註：政府 OpenAPI 提供的是每日收盤價/延遲大表。
-                    // 為了滿足您要求「每 3 秒更新」的動態看盤視覺效果，我們以政府真實報價為基準點，加入千分之二的微幅視覺震盪。
-                    // 這樣既能帶入真實價格，又能擁有盤中跳動感！
+                    // 以政府真實報價為基準點，加入千分之二的微幅視覺震盪來模擬跳動感
                     const basePrice = govInfo.price;
                     newPrice = basePrice * (1 + (Math.random() - 0.5) * 0.002);
                 } else {
+                    // 若無資料，則在原地微幅跳動
                     newPrice = stock.currentPrice * (1 + (Math.random() - 0.5) * 0.005);
                 }
 
@@ -374,17 +438,20 @@
                     const priceTd = document.getElementById(`price-${stock.id}`);
                     if(priceTd) {
                         priceTd.classList.remove('price-flash-up', 'price-flash-down');
-                        void priceTd.offsetWidth; // 觸發瀏覽器重繪
+                        void priceTd.offsetWidth; 
                         priceTd.classList.add(stock.currentPrice >= oldPrice ? 'price-flash-up' : 'price-flash-down');
                     }
                 }
             }
             
-            if (hasChanges) renderPortfolio();
+            if (hasChanges) {
+                renderPortfolio();
+                savePortfolio(); // 確保即時價格變動時也能更新到本機儲存
+            }
             
-            // 依據是否成功取得真實資料更新燈號
-            statusBadge.classList.remove('bg-blue-900', 'text-blue-400');
-            if (anyRealData) {
+            // 更新 UI 燈號
+            statusBadge.classList.remove('bg-blue-900', 'text-blue-400', 'bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400');
+            if (isConnected) {
                 statusBadge.classList.add('bg-green-900', 'text-green-400');
                 statusBadge.innerHTML = '<i class="fa-solid fa-building-columns mr-1"></i>政府 OpenAPI 連線正常';
             } else {
@@ -538,7 +605,7 @@
             }, 1000);
         }
 
-        // 模擬補充資料庫 (提供基本的產業類別與配息紀錄)
+        // 模擬補充資料庫
         const mockStockDatabase = {
             '2330': { type: 'tech', dividend: '季配 (3,6,9,12)' },
             '2317': { type: 'tech', dividend: '年配 (7)' },
@@ -557,7 +624,7 @@
             
             if (!idInput) return;
 
-            if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i> 政府開放資料查詢中...';
+            if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i> 資料查詢中...';
 
             const priceMap = await fetchGovernmentData();
             const govInfo = priceMap[idInput];
@@ -566,11 +633,10 @@
                 document.getElementById('new-stock-name').value = govInfo.name;
                 document.getElementById('new-stock-type').value = mockStockDatabase[idInput]?.type || 'other';
                 document.getElementById('new-stock-dividend').value = mockStockDatabase[idInput]?.dividend || '依公司公告';
-                // 帶入政府真實現價
                 document.getElementById('new-stock-current').value = govInfo.price;
                 
                 if(symbolStatus) {
-                    symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> 政府 OpenAPI 帶入成功';
+                    symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> OpenAPI 帶入成功';
                 }
                 
                 const fields = ['new-stock-name', 'new-stock-type', 'new-stock-dividend', 'new-stock-current'];
@@ -623,7 +689,7 @@
             document.getElementById('new-stock-dividend').value = stock.dividend;
             document.getElementById('new-stock-shares').value = stock.shares;
             document.getElementById('new-stock-avg').value = stock.avgPrice;
-            document.getElementById('new-stock-current').value = stock.currentPrice;
+            document.getElementById('new-stock-current').value = stock.currentPrice.toFixed(2);
 
             document.getElementById('stock-modal-icon').className = 'fa-solid fa-pen-to-square text-blue-400';
             document.getElementById('stock-modal-text').textContent = '編輯庫存標的';
@@ -669,6 +735,9 @@
                 portfolio[editStockIndex] = newStock;
             }
             
+            // 將更新後的資料儲存到瀏覽器本機端
+            savePortfolio();
+            
             renderPortfolio();
             closeAddStockModal();
             
@@ -712,6 +781,10 @@
         function executeDelete() {
             if (deleteStockIndex > -1) {
                 portfolio.splice(deleteStockIndex, 1); 
+                
+                // 將刪除後的資料狀態儲存到瀏覽器本機端
+                savePortfolio();
+                
                 renderPortfolio(); 
                 closeDeleteModal(); 
             }
