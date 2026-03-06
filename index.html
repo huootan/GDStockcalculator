@@ -55,22 +55,30 @@
     <!-- 主內容區 -->
     <main class="flex-1 flex flex-col h-screen overflow-hidden bg-gray-900 relative z-10">
         
-        <!-- 頂部資訊列 (修復手機排版，改為彈性高度與堆疊) -->
+        <!-- 頂部資訊列 (加入手動更新按鈕與警告標籤) -->
         <header class="h-auto min-h-[4rem] py-3 md:py-0 bg-gray-800 border-b border-gray-700 flex flex-col md:flex-row items-center px-4 md:px-6 justify-between shrink-0 gap-3 md:gap-0">
-            <h1 class="text-lg md:text-xl font-bold text-white flex flex-col sm:flex-row items-center gap-2 md:gap-3 text-center sm:text-left w-full md:w-auto">
+            <h1 class="text-lg md:text-xl font-bold text-white flex flex-col sm:flex-row items-center gap-2 md:gap-3 text-center sm:text-left w-full md:w-auto flex-wrap">
                 證券帳務總覽
                 <span id="sync-status" class="text-xs bg-green-900 text-green-400 px-2 py-1 rounded-full border border-green-700 transition-colors whitespace-nowrap">
                     <i class="fa-solid fa-building-columns mr-1"></i>連線中...
                 </span>
+                <!-- API 限流警告標籤 -->
+                <span id="api-warning-badge" class="hidden text-xs bg-red-900 text-red-400 px-2 py-1 rounded-full border border-red-700 whitespace-nowrap animate-pulse">
+                    <i class="fa-solid fa-ban mr-1"></i>遭請求單位限流警告
+                </span>
             </h1>
-            <div class="flex items-center justify-between w-full md:w-auto gap-4">
+            <div class="flex items-center justify-between w-full md:w-auto gap-3">
+                <!-- 手動更新按鈕 -->
+                <button id="manual-refresh-btn" onclick="manualRefresh()" class="bg-blue-600 hover:bg-blue-500 text-white text-sm px-3 py-1.5 rounded transition-colors flex items-center gap-2 whitespace-nowrap shrink-0">
+                    <i class="fa-solid fa-rotate-right"></i> <span class="hidden sm:inline">更新報價</span>
+                </button>
                 <!-- 資料來源下拉式選單 -->
                 <select id="data-source-select" class="flex-1 md:flex-none bg-gray-900 text-sm text-gray-300 border border-gray-600 rounded px-2 py-1.5 focus:outline-none focus:border-blue-500 transition-colors cursor-pointer" onchange="changeDataSource(this.value)">
                     <option value="openapi">政府 OpenAPI (收盤)</option>
                     <option value="twse_mis">證交所 MIS (即時)</option>
                     <option value="yahoo">Yahoo Finance (即時)</option>
                 </select>
-                <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center font-bold text-white shrink-0">王</div>
+                <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center font-bold text-white shrink-0 hidden sm:flex">王</div>
             </div>
         </header>
 
@@ -326,7 +334,6 @@
         // 防呆保護：若先前的儲存值為 mock，則重置回 openapi
         if (currentDataSource === 'mock') currentDataSource = 'openapi'; 
         document.getElementById('data-source-select').value = currentDataSource;
-        let pollingIntervalId = null; 
 
         function changeDataSource(source) {
             currentDataSource = source;
@@ -341,8 +348,7 @@
             }
 
             const statusBadge = document.getElementById('sync-status');
-            executePricesSync(statusBadge);
-            startDynamicPolling();
+            executePricesSync(statusBadge, false);
         }
 
         // 清除暫存並重置系統
@@ -353,6 +359,26 @@
                 localStorage.removeItem('twStockYieldCache_v1'); // 一併清除殖利率快取
                 location.reload();
             }
+        }
+
+        // 手動更新報價按鈕觸發
+        async function manualRefresh() {
+            const statusBadge = document.getElementById('sync-status');
+            const refreshBtn = document.getElementById('manual-refresh-btn');
+            const icon = refreshBtn.querySelector('i');
+            
+            // 點擊時啟動轉圈動畫並鎖定按鈕
+            icon.classList.add('fa-spin');
+            refreshBtn.disabled = true;
+            refreshBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            // 強制繞過快取執行更新 (傳遞 forceRefresh = true)
+            await executePricesSync(statusBadge, true);
+
+            // 恢復按鈕狀態
+            icon.classList.remove('fa-spin');
+            refreshBtn.disabled = false;
+            refreshBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         }
 
         // 預設資料僅作畫面初次呈現用，不做為後續輸入時的自動帶入依據
@@ -392,20 +418,51 @@
         let lastYieldFetchTime = 0;
         let isFetching = false;
         let errorCooldown = 0; 
+        
+        // 限流警告狀態全域變數
+        let isApiWarned = false;
 
         // 本機持久化快取 Keys (前端的微型資料庫)
         const PRICE_CACHE_KEY = 'twStockPriceCache_v1';
         const YIELD_CACHE_KEY = 'twStockYieldCache_v1';
 
-        // --- 強健的網路連線引擎 (三段式無縫備援) ---
+        // 設定並顯示 API 限流警告標籤
+        function setApiWarning(warn) {
+            isApiWarned = warn;
+            const badge = document.getElementById('api-warning-badge');
+            if (badge) {
+                if (warn) badge.classList.remove('hidden');
+                else badge.classList.add('hidden');
+            }
+        }
+
+        // --- 強健的網路連線引擎 (三段式無縫備援，具備限流偵測) ---
         async function safeFetchJSON(url, isLarge = false) {
-            const timeout = isLarge ? 12000 : 6000; 
+            const timeout = isLarge ? 8000 : 5000; // 縮短超時時間，避免畫面卡頓
+
+            // 檢查回應是否觸發限流狀態 (429 Too Many Requests, 403 Forbidden)
+            const checkRes = async (res, isAllOrigins = false) => {
+                if (res.status === 429 || res.status === 403) {
+                    setApiWarning(true);
+                    return null;
+                } else if (res.ok) {
+                    const data = await res.json();
+                    if (isAllOrigins && data && data.contents) {
+                        try { return JSON.parse(data.contents); } 
+                        catch(err) { return data.contents; }
+                    }
+                    return data;
+                }
+                return null;
+            }
+
             try {
                 const controller = new AbortController();
                 const id = setTimeout(() => controller.abort(), timeout);
                 const res = await window.fetch(url, { signal: controller.signal });
                 clearTimeout(id);
-                if (res.ok) return await res.json();
+                const data = await checkRes(res);
+                if (data) return data;
             } catch (e) {}
             
             try {
@@ -414,7 +471,8 @@
                 const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`;
                 const res = await window.fetch(proxyUrl, { signal: controller.signal });
                 clearTimeout(id);
-                if (res.ok) return await res.json();
+                const data = await checkRes(res);
+                if (data) return data;
             } catch (e) {}
 
             try {
@@ -423,35 +481,34 @@
                 const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
                 const res = await window.fetch(proxyUrl, { signal: controller.signal });
                 clearTimeout(id);
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data && data.contents) {
-                        try { return JSON.parse(data.contents); } 
-                        catch(err) { return data.contents; }
-                    }
-                }
+                if (res.status === 429 || res.status === 403) setApiWarning(true);
+                const data = await checkRes(res, true);
+                if (data) return data;
             } catch (e) {}
             return null;
         }
 
-        // 撈取真實「現價」API
-        async function fetchGovernmentData() {
+        // 撈取真實「現價」API (增加強制刷新參數)
+        async function fetchGovernmentData(forceRefresh = false) {
             const now = Date.now();
-            if (govDataCache && (now - lastFetchTime < 60000)) return govDataCache;
-            if (now < errorCooldown || isFetching) return govDataCache || {};
+            
+            if (!forceRefresh) {
+                if (govDataCache && (now - lastFetchTime < 60000)) return govDataCache;
+                if (now < errorCooldown || isFetching) return govDataCache || {};
 
-            // 1. 檢查本機持久化快取資料庫 (設定 4 小時過期，避免頻繁重整時狂打 API)
-            try {
-                const cachedStr = localStorage.getItem(PRICE_CACHE_KEY);
-                if (cachedStr) {
-                    const cachedObj = JSON.parse(cachedStr);
-                    if (now - cachedObj.timestamp < 4 * 60 * 60 * 1000) { // 4 小時內的資料直接沿用
-                        govDataCache = cachedObj.data;
-                        lastFetchTime = now;
-                        return govDataCache;
+                // 1. 檢查本機持久化快取資料庫 (設定 4 小時過期，避免頻繁重整時狂打 API)
+                try {
+                    const cachedStr = localStorage.getItem(PRICE_CACHE_KEY);
+                    if (cachedStr) {
+                        const cachedObj = JSON.parse(cachedStr);
+                        if (now - cachedObj.timestamp < 4 * 60 * 60 * 1000) { // 4 小時內的資料直接沿用
+                            govDataCache = cachedObj.data;
+                            lastFetchTime = now;
+                            return govDataCache;
+                        }
                     }
-                }
-            } catch(e) {}
+                } catch(e) {}
+            }
 
             isFetching = true;
             const tseData = await safeFetchJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', true);
@@ -502,24 +559,27 @@
             }
         }
 
-        // 撈取真實「最新殖利率」API (串接證交所 BWIBBU_ALL / 櫃買中心 PER_DIV_PU)
-        async function fetchGovernmentYieldData() {
+        // 撈取真實「最新殖利率」API (增加強制刷新參數)
+        async function fetchGovernmentYieldData(forceRefresh = false) {
             const now = Date.now();
-            // 記憶體快取 1 小時
-            if (govYieldCache && (now - lastYieldFetchTime < 3600000)) return govYieldCache;
+            
+            if (!forceRefresh) {
+                // 記憶體快取 1 小時
+                if (govYieldCache && (now - lastYieldFetchTime < 3600000)) return govYieldCache;
 
-            // 1. 檢查本機持久化快取資料庫 (殖利率變動極慢，設定 12 小時過期)
-            try {
-                const cachedStr = localStorage.getItem(YIELD_CACHE_KEY);
-                if (cachedStr) {
-                    const cachedObj = JSON.parse(cachedStr);
-                    if (now - cachedObj.timestamp < 12 * 60 * 60 * 1000) { // 12 小時內的資料直接沿用
-                        govYieldCache = cachedObj.data;
-                        lastYieldFetchTime = now;
-                        return govYieldCache;
+                // 1. 檢查本機持久化快取資料庫 (殖利率變動極慢，設定 12 小時過期)
+                try {
+                    const cachedStr = localStorage.getItem(YIELD_CACHE_KEY);
+                    if (cachedStr) {
+                        const cachedObj = JSON.parse(cachedStr);
+                        if (now - cachedObj.timestamp < 12 * 60 * 60 * 1000) { // 12 小時內的資料直接沿用
+                            govYieldCache = cachedObj.data;
+                            lastYieldFetchTime = now;
+                            return govYieldCache;
+                        }
                     }
-                }
-            } catch(e) {}
+                } catch(e) {}
+            }
 
             const tseYield = await safeFetchJSON('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL', true);
             const otcYield = await safeFetchJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis', true);
@@ -557,10 +617,10 @@
             return yieldMap;
         }
 
-        async function fetchTWSEBatchData(stockIds) {
+        async function fetchTWSEBatchData(stockIds, force = false) {
             if (!stockIds || stockIds.length === 0) return {};
             const now = Date.now();
-            if (now < errorCooldown) return {};
+            if (!force && now < errorCooldown) return {};
 
             try {
                 const exChList = stockIds.map(id => `tse_${id}.tw|otc_${id}.tw`).join('|');
@@ -586,10 +646,10 @@
             }
         }
 
-        async function fetchYahooBatchData(stockIds) {
+        async function fetchYahooBatchData(stockIds, force = false) {
             if (!stockIds || stockIds.length === 0) return {};
             const now = Date.now();
-            if (now < errorCooldown) return {};
+            if (!force && now < errorCooldown) return {};
 
             try {
                 const symbols = stockIds.map(id => `${id}.TW,${id}.TWO`).join(',');
@@ -616,18 +676,6 @@
             }
         }
 
-        function startDynamicPolling() {
-            if (pollingIntervalId) clearInterval(pollingIntervalId);
-
-            const statusBadge = document.getElementById('sync-status');
-            let interval = 8000; 
-            if (currentDataSource === 'openapi') interval = 300000; 
-
-            pollingIntervalId = setInterval(async () => {
-                await executePricesSync(statusBadge);
-            }, interval);
-        }
-
         async function initSystem() {
             const statusBadge = document.getElementById('sync-status');
             const thTitle = document.getElementById('th-current-price');
@@ -639,13 +687,23 @@
             }
             
             renderPortfolio();
-            await executePricesSync(statusBadge);
-            startDynamicPolling();
+            // 初始載入不要強制繞過快取
+            await executePricesSync(statusBadge, false);
+
+            // 背景非同步載入巨量資料，暖機快取 (不阻塞主畫面)，確保新增股票帶入瞬間完成
+            setTimeout(() => {
+                fetchGovernmentYieldData(false);
+                fetchGovernmentData(false); 
+            }, 2000);
         }
 
-        async function executePricesSync(statusBadge) {
+        // 執行報價同步 (支援是否強制繞過快取的參數)
+        async function executePricesSync(statusBadge, forceRefresh = false) {
             if (portfolio.length === 0) return;
             
+            // 每次手動或自動更新前，重置警告狀態，給 API 重新連線的機會
+            if (forceRefresh) setApiWarning(false);
+
             statusBadge.classList.remove('bg-green-900', 'text-green-400', 'bg-yellow-900', 'text-yellow-400', 'bg-purple-900', 'text-purple-400');
             statusBadge.classList.add('bg-blue-900', 'text-blue-400');
             statusBadge.innerHTML = '<i class="fa-solid fa-arrows-rotate fa-spin mr-1"></i>資料同步中...';
@@ -653,7 +711,7 @@
             const uniqueStockIds = [...new Set(portfolio.map(s => s.id))];
             let priceMap = {};
             
-            if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData();
+            if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData(forceRefresh);
             else if (currentDataSource === 'twse_mis') priceMap = await fetchTWSEBatchData(uniqueStockIds);
             else if (currentDataSource === 'yahoo') priceMap = await fetchYahooBatchData(uniqueStockIds);
 
@@ -695,7 +753,11 @@
                 else if (currentDataSource === 'yahoo') statusBadge.innerHTML = '<i class="fa-brands fa-yahoo mr-1"></i>Yahoo 連線正常';
             } else {
                 statusBadge.classList.add('bg-yellow-900', 'text-yellow-400');
-                statusBadge.innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>連線異常，維持目前報價';
+                if (isApiWarned) {
+                    statusBadge.innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>更新失敗 (遭限流)';
+                } else {
+                    statusBadge.innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>連線異常，維持目前報價';
+                }
             }
         }
 
@@ -832,20 +894,37 @@
 
             symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i>';
 
-            let priceMap = {};
-            if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData();
-            else if (currentDataSource === 'twse_mis') priceMap = await fetchTWSEBatchData([idInput]);
-            else if (currentDataSource === 'yahoo') priceMap = await fetchYahooBatchData([idInput]);
+            let apiInfo = null;
 
-            const info = priceMap[idInput];
+            // 1. 優先從已建立的政府資料快取中尋找 (最快，瞬間帶入)
+            if (govDataCache && govDataCache[idInput]) {
+                apiInfo = govDataCache[idInput];
+            }
+
+            // 2. 如果快取沒有，針對單一股票發起即時查詢 (繞過全域 errorCooldown)
+            if (!apiInfo) {
+                if (currentDataSource === 'twse_mis') {
+                    const map = await fetchTWSEBatchData([idInput], true);
+                    apiInfo = map[idInput];
+                } else {
+                    const map = await fetchYahooBatchData([idInput], true);
+                    apiInfo = map[idInput];
+                }
+            }
+
+            // 3. 終極備援：如果上述都失敗，強制使用 Yahoo API 查單一股票 (最穩定)
+            if (!apiInfo && currentDataSource === 'twse_mis') {
+                const fallbackMap = await fetchYahooBatchData([idInput], true);
+                apiInfo = fallbackMap[idInput];
+            }
 
             // 若有撈到真實名稱與股價
-            if (info) {
-                document.getElementById('target-stock-name').value = info.name || '';
-                document.getElementById('target-stock-price').value = info.price || '';
+            if (apiInfo) {
+                document.getElementById('target-stock-name').value = apiInfo.name || '';
+                document.getElementById('target-stock-price').value = apiInfo.price || '';
                 
                 // 去撈最新的真實殖利率
-                const yieldMap = await fetchGovernmentYieldData();
+                const yieldMap = await fetchGovernmentYieldData(false);
                 currentTargetYield = yieldMap[idInput] || 0.0;
                 document.getElementById('target-yield-rate').value = currentTargetYield > 0 ? currentTargetYield.toFixed(2) : '0.0';
                 
@@ -924,12 +1003,30 @@
 
             if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i> 資料查詢中...';
 
-            let priceMap = {};
-            if (currentDataSource === 'openapi') priceMap = await fetchGovernmentData();
-            else if (currentDataSource === 'twse_mis') priceMap = await fetchTWSEBatchData([idInput]);
-            else if (currentDataSource === 'yahoo') priceMap = await fetchYahooBatchData([idInput]);
+            let apiInfo = null;
 
-            const apiInfo = priceMap[idInput];
+            // 1. 優先從已建立的政府資料快取中尋找 (最快，瞬間帶入)
+            if (govDataCache && govDataCache[idInput]) {
+                apiInfo = govDataCache[idInput];
+            }
+
+            // 2. 如果快取沒有，針對單一股票發起即時查詢 (傳入 true 繞過全域 errorCooldown)
+            if (!apiInfo) {
+                if (currentDataSource === 'twse_mis') {
+                    const map = await fetchTWSEBatchData([idInput], true);
+                    apiInfo = map[idInput];
+                } else {
+                    const map = await fetchYahooBatchData([idInput], true);
+                    apiInfo = map[idInput];
+                }
+            }
+
+            // 3. 終極備援：如果證交所 API 查不到，自動啟動 Yahoo 備援查詢 (最穩定)
+            if (!apiInfo && currentDataSource === 'twse_mis') {
+                if(symbolStatus) symbolStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-blue-400"></i> 啟動備援查詢...';
+                const fallbackMap = await fetchYahooBatchData([idInput], true);
+                apiInfo = fallbackMap[idInput];
+            }
 
             if (apiInfo) {
                 // 1. 帶入真實價格與名稱
@@ -937,17 +1034,17 @@
                 document.getElementById('new-stock-current').value = apiInfo.price;
                 
                 // 2. 獲取政府開放資料中的真實殖利率並帶入
-                const yieldMap = await fetchGovernmentYieldData();
+                const yieldMap = await fetchGovernmentYieldData(false);
                 const realYield = yieldMap[idInput];
                 document.getElementById('new-stock-yield').value = realYield ? realYield.toFixed(2) : '';
 
-                // 3. 其餘無免費 API 可單次抓取的資料，維持預設/空白讓使用者根據自己的研究結果填寫 (不用模擬去猜測)
+                // 3. 其餘無免費 API 可單次抓取的資料，維持預設/空白
                 document.getElementById('new-stock-type').value = 'other';
                 document.getElementById('new-stock-dividend').value = '';
                 document.getElementById('new-stock-eps').value = 'na';
                 
                 if(symbolStatus) {
-                    symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> 真實報價與殖利率帶入成功';
+                    symbolStatus.innerHTML = '<i class="fa-solid fa-check text-green-400"></i> 真實報價帶入成功';
                 }
                 
                 const fields = ['new-stock-name', 'new-stock-current', 'new-stock-yield'];
